@@ -1,11 +1,16 @@
 # H-GTCRN
-This repository is the official implementation of the Interspeech2025 paper: A Lightweight Hybrid Dual Channel Speech Enhancement System under Low-SNR Conditions. For more details, please refer to the [arXiv preprint](https://arxiv.org/abs/2505.19597).
+This repository is the official implementation of the Interspeech2025 paper: A Lightweight Hybrid Dual Channel Speech Enhancement System under Low-SNR Conditions. For more details, please refer to the [Interspeech 2025](https://www.isca-archive.org/interspeech_2025/wang25h_interspeech.html).
 
 | ![The framework of our proposed system.](./figures/model.png) |
 |:---------------------:|
 | **Figure 1:** The framework of our proposed system. |
 
-# Audio samples
+## 🔥 News
+- [**2026-3-13**] The model implementation and pre-trained checkpoint are released.
+- [**2025-8-17**] The paper is uploaded to ISCA Archive [Interspeech 2025](https://www.isca-archive.org/interspeech_2025/wang25h_interspeech.html).
+- [**2025-5-25**] The paper is uploaded to arxiv [![arxiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2505.19597).
+
+## Audio samples
 The directory structure of the audio samples is shown below:
 ```markdown
     samples
@@ -26,7 +31,19 @@ The directory structure of the audio samples is shown below:
         └── Samples3_Proposed.wav
 ```
 
-# Credits
+## Citation
+If you find this work useful, please cite our paper:
+```bibtex
+@inproceedings{wang2025lightweight,
+  title={A Lightweight Hybrid Dual Channel Speech Enhancement System under Low-SNR Conditions},
+  author={Wang, Zheng and Rong, Xiaobin and Sun, Yu and Sun, Tianchi and Lin, Zhibin and Lu, Jing},
+  booktitle={Proc. Interspeech 2025},
+  pages={1178--1182},
+  year={2025}
+}
+```
+
+## Credits
 We gratefully acknowledge the following resources that made this project possible:
 - [GTCRN](https://github.com/Xiaobin-Rong/gtcrn): SOTA lightweight speech enhancement model architecture.
 - [SE-train](https://github.com/Xiaobin-Rong/SEtrain): Excellent training code template for DNN-based speech enhancement.
