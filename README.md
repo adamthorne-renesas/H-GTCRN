@@ -10,6 +10,13 @@ This repository is the official implementation of the Interspeech2025 paper: A L
 - [**2025-8-17**] The paper is uploaded to [ISCA Archive](https://www.isca-archive.org/interspeech_2025/wang25h_interspeech.html).
 - [**2025-5-25**] The paper is uploaded to arxiv [![arxiv](https://img.shields.io/badge/arXiv-Paper-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2505.19597).
 
+## Inference
+To run inference on audio files, use:
+
+```bash
+python infer.py --input_dir <input_dir> --output_dir <output_dir> --checkpoint <checkpoint> --device <device> --suffix <suffix>
+```
+
 ## Audio samples
 The directory structure of the audio samples is shown below:
 ```markdown
