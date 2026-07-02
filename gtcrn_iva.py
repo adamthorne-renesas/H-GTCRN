@@ -124,9 +124,11 @@ def auxiva(X, n_src=None, n_iter=20, proj_back=True, W0=None, model="laplace"):
                 torch.matmul(W[:, :, None, s, :], V[:, :, :, :]),
                 torch.conj(W[:, :, s, :, None]),
             )
-            W[:, :, s, :] /= torch.sqrt(
-                denom[:, :, :, 0] + eps * torch.ones((n_batches, n_freq, 1)).to(device)
-            )
+            # Avoid fragile in-place complex divide/sqrt CUDA path by scaling with
+            # a real positive factor (theoretically denom is real and > 0 here).
+            denom_real = torch.clamp(denom[:, :, :, 0].real, min=eps)
+            scale = torch.rsqrt(denom_real)
+            W[:, :, s, :] = W[:, :, s, :] * scale
 
     demix(Y, X, W)
 
@@ -407,20 +409,20 @@ class DPGRNN(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self):
+    def __init__(self, in_channels=6, channels=16):
         super().__init__()
         self.en_convs = nn.ModuleList(
             [
-                ConvBlock(6 * 3, 16, (1, 5), stride=(1, 2), padding=(0, 2)),
-                ConvBlock(16, 16, (1, 5), stride=(1, 2), padding=(0, 2), groups=2),
+                ConvBlock(in_channels * 3, channels, (1, 5), stride=(1, 2), padding=(0, 2)),
+                ConvBlock(channels, channels, (1, 5), stride=(1, 2), padding=(0, 2), groups=2),
                 GTConvBlock(
-                    16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(1, 1)
+                    channels, channels, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(1, 1)
                 ),
                 GTConvBlock(
-                    16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(2, 1)
+                    channels, channels, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(2, 1)
                 ),
                 GTConvBlock(
-                    16, 16, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(5, 1)
+                    channels, channels, (3, 3), stride=(1, 1), padding=(0, 1), dilation=(5, 1)
                 ),
             ]
         )
@@ -484,15 +486,46 @@ class Mask(nn.Module):
 
 
 class GTCRN_IVA(nn.Module):
-    def __init__(self):
+    def __init__(self, aux_info="sn", feature="lps", masking="mask2", encoder="single"):
+        """
+        aux_info: "s"    -> use only the selected (speech) IVA channel
+                  "sn"   -> use both selected (speech) and unselected (noise) channels
+        feature:  "lps"  -> log-power spectrogram of the IVA feature (1 ch / channel)
+                  "complex" -> real & imaginary parts of the IVA feature (2 ch / channel)
+        masking:  "mask1" -> apply the CRM to the IVA (selected) output
+                  "mask2" -> apply the CRM to the raw noisy input
+        encoder:  "single" -> one shared encoder
+                  "dual"   -> separate encoders for the original and auxiliary streams
+        The defaults reproduce ID 6 (IVA-S&N + LPS + Masking 2), the proposed model.
+        """
         super().__init__()
+        assert aux_info in ("s", "sn")
+        assert feature in ("lps", "complex")
+        assert masking in ("mask1", "mask2")
+        assert encoder in ("single", "dual")
+        self.aux_info = aux_info
+        self.feature = feature
+        self.masking = masking
+        self.encoder_type = encoder
+
         self.n_fft = 512
         self.hop_len = 256
         self.win_len = 512
 
+        feat_per_ch = 1 if feature == "lps" else 2
+        num_aux = feat_per_ch * (2 if aux_info == "sn" else 1)
+        in_channels = 4 + num_aux  # 4 = real/imag of the 2-channel noisy mixture
+
         self.erb = ERB(65, 64)
         self.sfe = SFE(3, 1)
-        self.encoder = Encoder()
+        if encoder == "dual":
+            # Encode the original mixture and the IVA auxiliary streams separately,
+            # then concatenate along the channel dim (8 + 8 = 16) to feed the
+            # unchanged 16-wide backbone. See paper Sec. 3.3 (dual encoder).
+            self.encoder = Encoder(4, channels=8)          # original noisy-mixture stream
+            self.encoder_aux = Encoder(num_aux, channels=8)  # IVA auxiliary stream
+        else:
+            self.encoder = Encoder(in_channels)
         self.dpgrnn1 = DPGRNN(16, 33, 16)
         self.dpgrnn2 = DPGRNN(16, 33, 16)
         self.decoder = Decoder()
@@ -523,31 +556,47 @@ class GTCRN_IVA(nn.Module):
         spec_selected = spec_2ch[:, 0] * pred[:, 0] + spec_2ch[:, 1] * (1 - pred[:, 0])
         spec_unselected = spec_2ch[:, 1] * pred[:, 0] + spec_2ch[:, 0] * (1 - pred[:, 0])
 
-        # selected channel features
+        # selected / unselected channel real-imag: (B, 2, T, F)
         spec_sel = torch.view_as_real(spec_selected).permute(0, 3, 2, 1)
-        spec_sel_mag = torch.norm(spec_sel, dim=1, keepdim=True).clamp(1e-12)
-        spec_sel_log = torch.log10(spec_sel_mag)
-
-        # unselected channel features
         spec_un = torch.view_as_real(spec_unselected).permute(0, 3, 2, 1)
-        spec_un_mag = torch.norm(spec_un, dim=1, keepdim=True).clamp(1e-12)
-        spec_un_log = torch.log10(spec_un_mag)
+
+        # IVA feature type: LPS (log-power, 1 ch) or complex (real-imag, 2 ch)
+        if self.feature == "lps":
+            sel_feat = torch.log10(torch.norm(spec_sel, dim=1, keepdim=True).clamp(1e-12))
+            un_feat = torch.log10(torch.norm(spec_un, dim=1, keepdim=True).clamp(1e-12))
+        else:  # complex
+            sel_feat = spec_sel
+            un_feat = spec_un
+
+        # auxiliary info: speech only (S) or speech & noise (S&N)
+        aux_feats = [sel_feat] if self.aux_info == "s" else [sel_feat, un_feat]
 
         spec = torch.view_as_real(spec_orig)
         spec = rearrange(spec, "b c f t ri -> b (c ri) t f")
 
         # feature fusion
-        feat = torch.cat([spec, spec_sel_log, spec_un_log], dim=1)
+        feat = torch.cat([spec, *aux_feats], dim=1)
 
         # GTCRN
         feat = self.erb.bm(feat)
-        feat = self.sfe(feat)
-        feat, en_outs = self.encoder(feat)
+        if self.encoder_type == "dual":
+            # encode the two streams separately, then concatenate (8 + 8 = 16)
+            feat_o, en_o = self.encoder(self.sfe(feat[:, :4]))
+            feat_a, en_a = self.encoder_aux(self.sfe(feat[:, 4:]))
+            feat = torch.cat([feat_o, feat_a], dim=1)
+            en_outs = [torch.cat([eo, ea], dim=1) for eo, ea in zip(en_o, en_a)]
+        else:
+            # single encoder: streams already concatenated in `feat`, encode jointly
+            feat = self.sfe(feat)
+            feat, en_outs = self.encoder(feat)
         feat = self.dpgrnn1(feat)
         feat = self.dpgrnn2(feat)
         m_feat = self.decoder(feat, en_outs)
         m = self.erb.bs(m_feat)
-        spec_enh = self.mask(m, spec)
+
+        # masking target: IVA (selected) output (Masking 1) or raw noisy input (Masking 2)
+        spec_target = spec_sel if self.masking == "mask1" else spec
+        spec_enh = self.mask(m, spec_target)
 
         spec_enh = spec_enh.permute(0, 3, 2, 1)
         spec_enh = torch.complex(spec_enh[..., 0], spec_enh[..., 1])
@@ -559,18 +608,20 @@ class GTCRN_IVA(nn.Module):
 
 
 if __name__ == "__main__":
-    model = GTCRN_IVA().eval()
-
-    from ptflops import get_model_complexity_info
-    flops, params = get_model_complexity_info(
-        model,
-        (2, 16000),
-        as_strings=True,
-        print_per_layer_stat=False,
-        verbose=True,
-    )
-    print(f"Computational complexity: {flops}, Parameters: {params}")
+    # Paper ablation configurations (Table 1).
+    configs = {
+        1: dict(aux_info="s", feature="complex", masking="mask1", encoder="single"),
+        2: dict(aux_info="s", feature="complex", masking="mask2", encoder="single"),
+        3: dict(aux_info="s", feature="lps", masking="mask1", encoder="single"),
+        4: dict(aux_info="sn", feature="lps", masking="mask1", encoder="single"),
+        5: dict(aux_info="s", feature="lps", masking="mask2", encoder="single"),
+        6: dict(aux_info="sn", feature="lps", masking="mask2", encoder="single"),
+        7: dict(aux_info="sn", feature="lps", masking="mask2", encoder="dual"),
+    }
 
     x = torch.randn(3, 2, 16000)
-    y = model(x)
-    print(y.shape)
+    for idx, cfg in configs.items():
+        model = GTCRN_IVA(**cfg).eval()
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        y = model(x)
+        print(f"ID {idx}: {cfg} -> trainable_params={n_train/1e3:.2f}k, out={tuple(y.shape)}")
