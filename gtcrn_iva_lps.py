@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
-
+from vad_lps import vad_lps
 
 def multi_channel_stft(x, n_fft, hop_length, win_length, window, onesided=True):
     """
@@ -486,7 +486,7 @@ class Mask(nn.Module):
 
 
 class GTCRN_IVA(nn.Module):
-    def __init__(self, aux_info="sn", feature="lps", masking="mask2", encoder="single"):
+    def __init__(self, aux_info="sn", feature="lps", masking="mask2", encoder="single", ivabehaviour="original"):
         """
         aux_info: "s"    -> use only the selected (speech) IVA channel
                   "sn"   -> use both selected (speech) and unselected (noise) channels
@@ -507,6 +507,7 @@ class GTCRN_IVA(nn.Module):
         self.feature = feature
         self.masking = masking
         self.encoder_type = encoder
+        self.ivabehaviour = ivabehaviour
 
         self.n_fft = 512
         self.hop_len = 256
@@ -516,14 +517,18 @@ class GTCRN_IVA(nn.Module):
         num_aux = feat_per_ch * (2 if aux_info == "sn" else 1)
         in_channels = 4 + num_aux  # 4 = real/imag of the 2-channel noisy mixture
 
+        if encoder == "dual" and aux_info == "s" or encoder == "dual" and feature == "complex":
+            raise ValueError("Dual encoder is not supported for complex IVA features (2 ch).")
+
+
         self.erb = ERB(65, 64)
         self.sfe = SFE(3, 1)
         if encoder == "dual":
             # Encode the original mixture and the IVA auxiliary streams separately,
             # then concatenate along the channel dim (8 + 8 = 16) to feed the
             # unchanged 16-wide backbone. See paper Sec. 3.3 (dual encoder).
-            self.encoder = Encoder(4, channels=8)          # original noisy-mixture stream
-            self.encoder_aux = Encoder(num_aux, channels=8)  # IVA auxiliary stream
+            self.encoder = Encoder(4, channels=12)          # original noisy-mixture stream
+            self.encoder_aux = Encoder(num_aux, channels=12)  # IVA auxiliary stream
         else:
             self.encoder = Encoder(in_channels)
         self.dpgrnn1 = DPGRNN(16, 33, 16)
@@ -550,23 +555,48 @@ class GTCRN_IVA(nn.Module):
         spec_2ch = auxiva(spec_drb.transpose(1, 3), n_iter=10).transpose(1, 3) 
 
         # channel selection
-        spec_norm = torch.norm(spec_2ch, dim=(2, 3))
-        pred = torch.where(spec_norm[:, 0] < spec_norm[:, 1], 1, 0)
-        pred = pred.view(-1, 1, 1, 1)
-        spec_selected = spec_2ch[:, 0] * pred[:, 0] + spec_2ch[:, 1] * (1 - pred[:, 0])
-        spec_unselected = spec_2ch[:, 1] * pred[:, 0] + spec_2ch[:, 0] * (1 - pred[:, 0])
+        if self.ivabehaviour == "original":
+            spec_norm = torch.norm(spec_2ch, dim=(2, 3))
+            pred = torch.where(spec_norm[:, 0] < spec_norm[:, 1], 1, 0)
+            pred = pred.view(-1, 1, 1, 1)
+            spec_selected = spec_2ch[:, 0] * pred[:, 0] + spec_2ch[:, 1] * (1 - pred[:, 0])
+            spec_unselected = spec_2ch[:, 1] * pred[:, 0] + spec_2ch[:, 0] * (1 - pred[:, 0])
+            spec_sel = torch.view_as_real(spec_selected).permute(0, 3, 2, 1)
+            spec_un = torch.view_as_real(spec_unselected).permute(0, 3, 2, 1)
+            if self.feature == "lps":
+                sel_feat = torch.log10(torch.norm(spec_sel, dim=1, keepdim=True).clamp(1e-12))
+                un_feat = torch.log10(torch.norm(spec_un, dim=1, keepdim=True).clamp(1e-12))
+            else:  # complex
+                sel_feat = spec_sel
+                un_feat = spec_un
+        if self.ivabehaviour == "improved":
+            
+            vad = vad_lps(window=11)
+            selected_channel = vad.detect_voice_activity(
+                spec_2ch,
+                alpha=0.5,
+                beta=0.5
+            )
+            spec_selected = spec_2ch[
+                torch.arange(spec_2ch.size(0)),
+                selected_channel
+            ]
+            spec_unselected = spec_2ch[
+                torch.arange(spec_2ch.size(0)),
+                1 - selected_channel
+            ]
+            spec_sel = torch.view_as_real(spec_selected).permute(0, 3, 2, 1)
+            spec_un = torch.view_as_real(spec_unselected).permute(0, 3, 2, 1)
 
         # selected / unselected channel real-imag: (B, 2, T, F)
-        spec_sel = torch.view_as_real(spec_selected).permute(0, 3, 2, 1)
-        spec_un = torch.view_as_real(spec_unselected).permute(0, 3, 2, 1)
-
+        
         # IVA feature type: LPS (log-power, 1 ch) or complex (real-imag, 2 ch)
-        if self.feature == "lps":
-            sel_feat = torch.log10(torch.norm(spec_sel, dim=1, keepdim=True).clamp(1e-12))
-            un_feat = torch.log10(torch.norm(spec_un, dim=1, keepdim=True).clamp(1e-12))
-        else:  # complex
-            sel_feat = spec_sel
-            un_feat = spec_un
+            if self.feature == "lps":
+                sel_feat = torch.log10(torch.norm(spec_sel, dim=1, keepdim=True).clamp(1e-12))
+                un_feat = torch.log10(torch.norm(spec_un, dim=1, keepdim=True).clamp(1e-12))
+            else:  # complex
+                sel_feat = spec_sel
+                un_feat = spec_un
 
         # auxiliary info: speech only (S) or speech & noise (S&N)
         aux_feats = [sel_feat] if self.aux_info == "s" else [sel_feat, un_feat]
@@ -580,7 +610,7 @@ class GTCRN_IVA(nn.Module):
         # GTCRN
         feat = self.erb.bm(feat)
         if self.encoder_type == "dual":
-            # encode the two streams separately, then concatenate (8 + 8 = 16)
+            # encode the two streams separately, then concatenate (12 + 12 = 24)
             feat_o, en_o = self.encoder(self.sfe(feat[:, :4]))
             feat_a, en_a = self.encoder_aux(self.sfe(feat[:, 4:]))
             feat = torch.cat([feat_o, feat_a], dim=1)
