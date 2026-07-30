@@ -580,13 +580,9 @@ class GTCRN_IVA(nn.Module):
                 beta=0.5
             )
 
-            raw_wave = x[0, 0].detach().cpu().numpy()
-            N = 160
-            pad = (-raw_wave.size) % N
-            raw_padded = np.concatenate([raw_wave, np.zeros(pad, dtype=raw_wave.dtype)])
-            raw_frames = raw_padded.reshape(-1, N).T  # (N, nframes), one frame per column
+            # STFT of the raw noisy mixture (pre-WPE/IVA), same (B, C, F, T) shape as spec_2ch.
             ltsfraw, band_ratioraw, scoreraw, selected_channelraw, vadraw, decisionraw = vad_detector.detect_voice_activity(
-                            raw_frames,
+                            spec_orig,
                             alpha=0.5,
                             beta=0.5
                         )
@@ -600,7 +596,7 @@ class GTCRN_IVA(nn.Module):
                 axs[0].plot(_np(x[0, 0]))
                 axs[0].set_title('Input Audio (noisy)')
 
-                for ax, title, _vad, decision, band_ratio, ltsf, score, selected_channel in (
+                for ax, title, vad, decision, band_ratio, ltsf, score, selected_channel in (
                     (axs[1], 'Raw Audio', vadraw, decisionraw, band_ratioraw, ltsfraw, scoreraw, selected_channelraw),
                     (axs[2], 'Processed Audio', vad, decision, band_ratio, ltsf, score, selected_channel)
                 ):
