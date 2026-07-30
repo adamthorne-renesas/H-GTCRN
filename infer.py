@@ -5,9 +5,10 @@ import argparse
 import torch
 import soundfile as sf
 
-from gtcrn_iva import GTCRN_IVA
+from gtcrn_iva_sf_br import GTCRN_IVA
 import pdb
-
+from vad_nrg import run_energy_vad
+from matplotlib import pyplot as plt
 
 ##python infer.py --input_dir <in> --output_dir <out> --checkpoint <ckpt> --aux_info <s/sn> --feature <lps/complex> --masking <mask1/mask2> --encoder <single/dual> --device <cpu/0>--suffix <ssfx>
 
@@ -71,8 +72,14 @@ def parse_args():
         choices=["single", "dual"],
         help="'single' or 'dual'",
     )
+    parser.add_argument(
+            "--ivabehaviour",
+            type=str,
+            default="improved",
+            choices=["original", "improved"],
+            help="'original' or 'improved'",
+        )
     return parser.parse_args()
-
 
 def load_model(checkpoint_path: str, device: torch.device, **model_kwargs) -> GTCRN_IVA:
     model = GTCRN_IVA(**model_kwargs).to(device)
@@ -130,6 +137,7 @@ def main():
         feature=args.feature,
         masking=args.masking,
         encoder=args.encoder,
+        ivabehaviour=args.ivabehaviour
     )
 
     wav_files = sorted(
@@ -141,7 +149,6 @@ def main():
 
     if not wav_files:
         raise FileNotFoundError(f"No wav files found in input_dir: {args.input_dir}")
-
     for wav_name in wav_files:
         in_path = os.path.join(args.input_dir, wav_name)
         base_name, ext = os.path.splitext(wav_name)

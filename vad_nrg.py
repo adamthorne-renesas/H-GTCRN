@@ -61,7 +61,7 @@ def update_speech_threshold(
 
     return T_s
 
-def run_energy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s):
+def run_energy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s, plot_output = False):
     # Accept both torch tensors and numpy arrays
     is_torch = torch.is_tensor(frames)
     if is_torch:
@@ -123,7 +123,24 @@ def run_energy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s):
         T_n = torch.from_numpy(T_n).to(device=device, dtype=dtype)
         T_s = torch.from_numpy(T_s).to(device=device, dtype=dtype)
         vad_decision = torch.from_numpy(vad_decision).to(device=device)
-    
+
+    if plot_output is True:
+        def _np(t):
+            return t.detach().cpu().numpy() if torch.is_tensor(t) else t
+
+        e_st_np = _np(e_st)
+        fig, ax = plt.subplots(1, 1, figsize=(11, 5))
+        ax.plot(e_st_np, label='energy')
+        ax.plot(_np(e_noise), label='noise estimate')
+        ax.plot(_np(T_n), label='noise threshold')
+        ax.plot(_np(T_s), label='speech threshold')
+        ax.plot(_np(vad_decision) * np.max(e_st_np), label='energy vad (scaled)')
+        ax.set_title('Adaptive Energy VAD (Paper Sec. 3)')
+        ax.legend(loc='upper right')
+
+        fig.tight_layout()
+        plt.savefig('vad_output.png', dpi=300)
+        plt.show()
     return e_st, e_noise, T_n, T_s, vad_decision
 
 
@@ -155,7 +172,7 @@ data, fs = sf.read(fname)
 # Convert stereo to mono if needed
 data = data[:, 0] if data.ndim == 2 else data
 
-print(sf.check_format('b'))
+print(sf.check_format(fname))
 print(sf.info(fname))
 
 do_plot_input = True
@@ -213,7 +230,7 @@ e_st, e_noise, T_n, T_s, vad_decision = run_energy_vad(
 
 plot_output = True
 if plot_output is True:
-    fig, axs = plt.subplots(3, 1, figsize=(11, 9), sharex=False)
+    fig, axs = plt.subplots(2, 1, figsize=(11, 9), sharex=False)
 
     axs[0].plot(data)
     axs[0].set_title('Input Audio')

@@ -2,7 +2,8 @@ import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
-from vad.vad_nrg.python.vad_nrg import run_energy_vad
+from vad_nrg import run_energy_vad
+from matplotlib import pyplot as plt
 
 def multi_channel_stft(x, n_fft, hop_length, win_length, window, onesided=True):
     """
@@ -124,11 +125,12 @@ def auxiva(X, n_src=None, n_iter=20, proj_back=True, W0=None, model="laplace"):
                 torch.matmul(W[:, :, None, s, :], V[:, :, :, :]),
                 torch.conj(W[:, :, s, :, None]),
             )
-            # Avoid fragile in-place complex divide/sqrt CUDA path by scaling with
-            # a real positive factor (theoretically denom is real and > 0 here).
-            denom_real = torch.clamp(denom[:, :, :, 0].real, min=eps)
-            scale = torch.rsqrt(denom_real)
-            W[:, :, s, :] = W[:, :, s, :] * scale
+            # Paper-faithful IVA weight normalization: divide by the complex sqrt of
+            # denom (Wang et al.). Kept out-of-place (assignment instead of `/=`) to
+            # avoid the fragile in-place complex divide CUDA path on some cu118 builds.
+            W[:, :, s, :] = W[:, :, s, :] / torch.sqrt(
+                denom[:, :, :, 0] + eps * torch.ones((n_batches, n_freq, 1), device=device)
+            )
 
     demix(Y, X, W)
 
@@ -567,9 +569,50 @@ class GTCRN_IVA(nn.Module):
             ad_sf_s = 0.999
             d_n = 0.4
             d_s = 0.5
-            # Pass torch tensors directly; VAD function handles conversion internally
-            vad_decision0 = run_energy_vad(spec_norm[:, 0, :], ad_sf_n, ad_sf_s, d_n, d_s)[4]
-            vad_decision1 = run_energy_vad(spec_norm[:, 1, :], ad_sf_n, ad_sf_s, d_n, d_s)[4]
+            # Pass torch tensors directly; VAD function handles conversion internally.
+            # plot_output=False: the combined figure is drawn below.
+            e_st0, e_noise0, T_n0, T_s0, vad_decision0 = run_energy_vad(
+                spec_norm[:, 0, :], ad_sf_n, ad_sf_s, d_n, d_s, plot_output=False)
+            e_st1, e_noise1, T_n1, T_s1, vad_decision1 = run_energy_vad(
+                spec_norm[:, 1, :], ad_sf_n, ad_sf_s, d_n, d_s, plot_output=False)
+
+            # NRG VAD applied directly to the raw noisy waveform (no GTCRN / no IVA):
+            # frame the time-domain signal into N-sample columns like the standalone VAD.
+            raw_wave = x[0, 0].detach().cpu().numpy()
+            N = 160
+            pad = (-raw_wave.size) % N
+            raw_padded = np.concatenate([raw_wave, np.zeros(pad, dtype=raw_wave.dtype)])
+            raw_frames = raw_padded.reshape(-1, N).T  # (N, nframes), one frame per column
+            e_st_raw, e_noise_raw, T_n_raw, T_s_raw, vad_raw = run_energy_vad(
+                raw_frames, ad_sf_n, ad_sf_s, d_n, d_s, plot_output=False)
+
+            plot_output = True
+            if plot_output:
+                def _np(t):
+                    return t.detach().cpu().numpy() if torch.is_tensor(t) else t
+
+                fig, axs = plt.subplots(4, 1, figsize=(11, 15), sharex=False)
+
+                axs[0].plot(_np(x[0, 0]))
+                axs[0].set_title('Input Audio (noisy)')
+
+                for ax, title, e_st, e_noise, T_n, T_s, vad_decision in (
+                    (axs[1], 'NRG VAD on raw audio (no GTCRN)', e_st_raw, e_noise_raw, T_n_raw, T_s_raw, vad_raw),
+                    (axs[2], 'Channel 1 Energy VAD (AuxIVA)', e_st0, e_noise0, T_n0, T_s0, vad_decision0),
+                    (axs[3], 'Channel 2 Energy VAD (AuxIVA)', e_st1, e_noise1, T_n1, T_s1, vad_decision1),
+                ):
+                    e_st_np = _np(e_st)
+                    ax.plot(e_st_np, label='energy')
+                    ax.plot(_np(e_noise), label='noise estimate')
+                    ax.plot(_np(T_n), label='noise threshold')
+                    ax.plot(_np(T_s), label='speech threshold')
+                    ax.plot(_np(vad_decision) * np.max(e_st_np), label='energy vad (scaled)')
+                    ax.set_title(title)
+                    ax.legend(loc='upper right')
+
+                fig.tight_layout()
+                plt.savefig('vad_output_hgtcrn.png', dpi=300)
+                plt.show()
 
             if vad_decision0.sum() > vad_decision1.sum():
                 spec_selected = spec_2ch[:, 0]

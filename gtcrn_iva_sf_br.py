@@ -2,7 +2,8 @@ import torch
 import numpy as np
 import torch.nn as nn
 from einops import rearrange
-from vad_lps import vad_lps
+from vad_sf_br import vad_sf_br
+from matplotlib import pyplot as plt
 
 def multi_channel_stft(x, n_fft, hop_length, win_length, window, onesided=True):
     """
@@ -124,11 +125,12 @@ def auxiva(X, n_src=None, n_iter=20, proj_back=True, W0=None, model="laplace"):
                 torch.matmul(W[:, :, None, s, :], V[:, :, :, :]),
                 torch.conj(W[:, :, s, :, None]),
             )
-            # Avoid fragile in-place complex divide/sqrt CUDA path by scaling with
-            # a real positive factor (theoretically denom is real and > 0 here).
-            denom_real = torch.clamp(denom[:, :, :, 0].real, min=eps)
-            scale = torch.rsqrt(denom_real)
-            W[:, :, s, :] = W[:, :, s, :] * scale
+            # Paper-faithful IVA weight normalization: divide by the complex sqrt of
+            # denom (Wang et al.). Kept out-of-place (assignment instead of `/=`) to
+            # avoid the fragile in-place complex divide CUDA path on some cu118 builds.
+            W[:, :, s, :] = W[:, :, s, :] / torch.sqrt(
+                denom[:, :, :, 0] + eps * torch.ones((n_batches, n_freq, 1), device=device)
+            )
 
     demix(Y, X, W)
 
@@ -571,12 +573,48 @@ class GTCRN_IVA(nn.Module):
                 un_feat = spec_un
         if self.ivabehaviour == "improved":
             
-            vad = vad_lps(window=11)
-            selected_channel = vad.detect_voice_activity(
+            vad_detector = vad_sf_br(window=11)
+            ltsf, band_ratio, score, selected_channel, vad, decision = vad_detector.detect_voice_activity(
                 spec_2ch,
                 alpha=0.5,
                 beta=0.5
             )
+
+            raw_wave = x[0, 0].detach().cpu().numpy()
+            N = 160
+            pad = (-raw_wave.size) % N
+            raw_padded = np.concatenate([raw_wave, np.zeros(pad, dtype=raw_wave.dtype)])
+            raw_frames = raw_padded.reshape(-1, N).T  # (N, nframes), one frame per column
+            ltsfraw, band_ratioraw, scoreraw, selected_channelraw, vadraw, decisionraw = vad_detector.detect_voice_activity(
+                            raw_frames,
+                            alpha=0.5,
+                            beta=0.5
+                        )
+
+            plot_output = True  # Set to True to enable plotting of VAD outputs
+            if plot_output is True:  # plot_output is True
+                def _np(t):
+                    return t.detach().cpu().numpy() if torch.is_tensor(t) else t
+                fig, axs = plt.subplots(4, 1, figsize=(11, 15), sharex=False)
+                
+                axs[0].plot(_np(x[0, 0]))
+                axs[0].set_title('Input Audio (noisy)')
+
+                for ax, title, _vad, decision, band_ratio, ltsf, score, selected_channel in (
+                    (axs[1], 'Raw Audio', vadraw, decisionraw, band_ratioraw, ltsfraw, scoreraw, selected_channelraw),
+                    (axs[2], 'Processed Audio', vad, decision, band_ratio, ltsf, score, selected_channel)
+                ):
+                    ax.plot(_np(decision), label='vad decision')
+                    ax.plot(_np(band_ratio), label='Band Ratio')
+                    ax.plot(_np(ltsf), label='LTSF')
+                    ax.plot(_np(score), label='vad output')
+                    ax.plot(_np(selected_channel), label='selected channel')
+                    ax.set_title(title)
+                    ax.legend(loc='upper right')
+                fig.tight_layout()
+                plt.savefig('vad_output_sf_br.png', dpi=300)
+                plt.show()
+
             spec_selected = spec_2ch[
                 torch.arange(spec_2ch.size(0)),
                 selected_channel
