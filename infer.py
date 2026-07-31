@@ -5,9 +5,9 @@ import argparse
 import torch
 import soundfile as sf
 
-from gtcrn_iva_sf_br import GTCRN_IVA
+from gtcrn_iva_nrg import GTCRN_IVA
 import pdb
-from vad_nrg import run_energy_vad
+from vad_sf_br import vad_sf_br
 from matplotlib import pyplot as plt
 
 ##python infer.py --input_dir <in> --output_dir <out> --checkpoint <ckpt> --aux_info <s/sn> --feature <lps/complex> --masking <mask1/mask2> --encoder <single/dual> --device <cpu/0>--suffix <ssfx>

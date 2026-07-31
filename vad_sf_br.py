@@ -15,13 +15,9 @@ class vad_sf_br:
     def compute_ltsf(self, signal):
         # Compute the magnitude spectrum
         magnitude = torch.abs(signal).pow(2)
-        
-        # Compute the long-term spectral flatness measure (LTSF)
         geometric_mean = torch.exp(torch.mean(torch.log(magnitude + 1e-10), dim=-2))
         arithmetic_mean = torch.mean(magnitude, dim=-2)
-        ltsf = geometric_mean / (arithmetic_mean + 1e-10)
-
-        ltsf = torch.nn.functional.avg_pool1d(ltsf, kernel_size=self.window, stride=1, padding=self.window//2).squeeze(1)
+        ltsf = geometric_mean / (arithmetic_mean + 1e-10)    
         
         return ltsf
     
@@ -37,13 +33,15 @@ class vad_sf_br:
         return band_ratio
     
     def detect_voice_activity(self, signal, alpha, beta, band_start=9, band_end=108,
-                              plot_output=True, streaming=False,
                               ema=0.9, t_low=0.4, t_high=0.6, switch_margin=0.05):
 
         band_ratio = self.compute_band_ratio(signal, band_start, band_end)
 
-        # Same flatness measure, but smoothed with past frames only (causal).
-        ltsf = self.compute_ltsf(signal)       
+        # Raw per-frame flatness ratio, unsmoothed, then smoothed with past
+        # frames only (causal) -- compute_ltsf's own avg_pool1d is centred
+        # (uses future frames) so it must not be used here.
+        
+        ltsf = self.compute_ltsf(signal)   # (B, C, T), unsmoothed
         B, C, T = ltsf.shape
         kernel = torch.ones(1, 1, self.window, device=ltsf.device, dtype=ltsf.dtype) / self.window
         padded = torch.nn.functional.pad(

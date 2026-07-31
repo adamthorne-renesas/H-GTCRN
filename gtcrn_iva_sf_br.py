@@ -596,28 +596,42 @@ class GTCRN_IVA(nn.Module):
                 axs[0].plot(_np(x[0, 0]))
                 axs[0].set_title('Input Audio (noisy)')
 
+                def _plot_series(ax, arr, label):
+                    # arr is (B, C, T), (B, T), or (B, C); drop the batch dim (B==1 here)
+                    # and plot each channel as its own line when a channel axis remains.
+                    arr = _np(arr)[0]
+                    if arr.ndim == 2:
+                        for c in range(arr.shape[0]):
+                            ax.plot(arr[c], label=f'{label} ch{c}')
+                    else:
+                        ax.plot(arr, label=label)
+
                 for ax, title, vad, decision, band_ratio, ltsf, score, selected_channel in (
                     (axs[1], 'Raw Audio', vadraw, decisionraw, band_ratioraw, ltsfraw, scoreraw, selected_channelraw),
                     (axs[2], 'Processed Audio', vad, decision, band_ratio, ltsf, score, selected_channel)
                 ):
-                    ax.plot(_np(decision), label='vad decision')
-                    ax.plot(_np(band_ratio), label='Band Ratio')
-                    ax.plot(_np(ltsf), label='LTSF')
-                    ax.plot(_np(score), label='vad output')
-                    ax.plot(_np(selected_channel), label='selected channel')
+                    _plot_series(ax, decision, 'vad decision')
+                    _plot_series(ax, band_ratio, 'Band Ratio')
+                    _plot_series(ax, ltsf, 'LTSF')
+                    _plot_series(ax, score, 'vad output')
+                    _plot_series(ax, selected_channel, 'selected channel')
                     ax.set_title(title)
                     ax.legend(loc='upper right')
                 fig.tight_layout()
                 plt.savefig('vad_output_sf_br.png', dpi=300)
                 plt.show()
 
+            # selected_channel is per-frame (B, T); collapse to one channel per
+            # utterance (majority vote) since masking/features are utterance-level.
+            selected_channel_utt = selected_channel.mode(dim=1).values
+
             spec_selected = spec_2ch[
                 torch.arange(spec_2ch.size(0)),
-                selected_channel
+                selected_channel_utt
             ]
             spec_unselected = spec_2ch[
                 torch.arange(spec_2ch.size(0)),
-                1 - selected_channel
+                1 - selected_channel_utt
             ]
             spec_sel = torch.view_as_real(spec_selected).permute(0, 3, 2, 1)
             spec_un = torch.view_as_real(spec_unselected).permute(0, 3, 2, 1)

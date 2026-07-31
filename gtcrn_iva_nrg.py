@@ -566,7 +566,7 @@ class GTCRN_IVA(nn.Module):
         if self.ivabehaviour == "improved":
             spec_norm = torch.norm(spec_2ch, dim=2)
             ad_sf_n = 0.98
-            ad_sf_s = 0.999
+            ad_sf_s = 0.9
             d_n = 0.4
             d_s = 0.5
             # Pass torch tensors directly; VAD function handles conversion internally.

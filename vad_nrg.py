@@ -144,6 +144,87 @@ def run_energy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s, plot_output = False):
     return e_st, e_noise, T_n, T_s, vad_decision
 
 
+def calculate_short_time_entropy(frames_np, eps=1e-12):
+    # spectral entropy per frame (column), Renevey's actual feature.
+    # raw entropy is HIGH for noise (flat spectrum) and LOW for speech (peaky
+    # spectrum) -- that's backwards vs e_st, so negate it here once, up front,
+    # so every downstream function (built for "bigger == more speech-like")
+    # just works unmodified.
+    spectrum = np.abs(np.fft.rfft(frames_np, axis=0)) ** 2
+    prob = spectrum / (np.sum(spectrum, axis=0, keepdims=True) + eps)
+    entropy = -np.sum(prob * np.log(prob + eps), axis=0)
+    return -entropy
+
+
+def run_entropy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s, plot_output=False):
+    # literal copy of run_energy_vad with e_st swapped for the entropy feature --
+    # every helper below (estimate_noise_energy_*_seg, update_*_threshold,
+    # is_speech_frame) is generic over "some scalar per frame" so none of it
+    # needed to change.
+    is_torch = torch.is_tensor(frames)
+    if is_torch:
+        device = frames.device
+        dtype = frames.dtype
+        frames_np = frames.cpu().numpy()
+    else:
+        device = None
+        dtype = None
+        frames_np = frames
+
+    nframes = frames_np.shape[1]
+    e_st = calculate_short_time_entropy(frames_np)
+    T_n = np.zeros(nframes)
+    T_s = np.zeros(nframes)
+    e_noise = np.zeros(nframes)
+
+    T_n[0] = e_st[0]
+    T_s[0] = e_st[0]
+
+    vad_decision = np.zeros(nframes)
+
+    for n in range(0, nframes - 1):
+
+        if n == 0:
+            e_noise[n] = e_st[0]
+        elif vad_decision[n-1] == 0:
+            e_noise[n] = estimate_noise_energy_noise_seg(
+                e_st[n], e_noise[n-1], ad_sf_n)
+        elif vad_decision[n-1] == 1:
+            e_noise[n] = estimate_noise_energy_speech_seg(
+                e_st[n], e_noise[n-1], ad_sf_s)
+
+        T_n[n] = update_noise_threshold(d_n, e_noise[n])
+        T_s[n] = update_speech_threshold(d_s, e_noise[n])
+
+        vad_decision[n] = is_speech_frame(
+            e_st[n], T_n[n], T_s[n], vad_decision[n-1])
+
+    if is_torch:
+        e_st = torch.from_numpy(e_st).to(device=device, dtype=dtype)
+        e_noise = torch.from_numpy(e_noise).to(device=device, dtype=dtype)
+        T_n = torch.from_numpy(T_n).to(device=device, dtype=dtype)
+        T_s = torch.from_numpy(T_s).to(device=device, dtype=dtype)
+        vad_decision = torch.from_numpy(vad_decision).to(device=device)
+
+    if plot_output is True:
+        def _np(t):
+            return t.detach().cpu().numpy() if torch.is_tensor(t) else t
+
+        e_st_np = _np(e_st)
+        fig, ax = plt.subplots(1, 1, figsize=(11, 5))
+        ax.plot(e_st_np, label='entropy score (negated)')
+        ax.plot(_np(e_noise), label='noise estimate')
+        ax.plot(_np(T_n), label='noise threshold')
+        ax.plot(_np(T_s), label='speech threshold')
+        ax.plot(_np(vad_decision) * np.max(e_st_np), label='entropy vad (scaled)')
+        ax.set_title('Adaptive Entropy VAD (Paper Sec. 2)')
+        ax.legend(loc='upper right')
+
+        fig.tight_layout()
+        plt.savefig('vad_output_entropy.png', dpi=300)
+        plt.show()
+    return e_st, e_noise, T_n, T_s, vad_decision
+
 
 # read input data from input file
 
