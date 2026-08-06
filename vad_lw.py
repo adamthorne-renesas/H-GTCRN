@@ -4,13 +4,14 @@ import matplotlib.pyplot as plt
 #from scipy.io import wavfile 
 import soundfile as sf
 import torch
-from scipy.fftpack import dct
 
 #https://www.sciencedirect.com/science/article/pii/S1051200423002464#se0050
 
 N_FFT = 512
-HOP_LEN = 256
-WIN_LEN = 512
+HOP_LEN_A = 160
+HOP_LEN_B = 320
+WIN_LEN_A = 320
+WIN_LEN_B = 640
 input_dir = "test/in"
 output_dir = "test/out_lw"
 
@@ -72,13 +73,22 @@ def mel_filter_bank(n_mels, n_fft, sample_rate, fmin=0.0, fmax=None):
                 fb[m - 1, k] = (right - k) / (right - center)
     return fb
 
+def dct_matrix(n_mels, device, dtype):
+    # DCT-II orthonormal matrix, shape (n_mels, n_mels)
+    n = torch.arange(n_mels, dtype=dtype, device=device)
+    k = n.unsqueeze(1)
+    M = torch.cos(torch.pi / n_mels * (n + 0.5) * k)
+    M *= torch.sqrt(torch.tensor(2.0 / n_mels))
+    M[0] *= 1 / torch.sqrt(torch.tensor(2.0))   # ortho normalization for k=0
+    return M   # apply via  log_mel @ M.T
 
 def mfcc(x, n_mels=26, n_mfcc_start=2, n_mfcc_end=14, N_FFT=512):
     power = torch.abs(x) ** 2
     mel_fb = mel_filter_bank(n_mels=n_mels, n_fft=N_FFT, sample_rate=16000)
     mel_energy = torch.matmul(power, mel_fb.T)
-    mfcc_np = dct(torch.log(mel_energy + 1e-10), type=2, axis=-1, norm='ortho')
-    mfcc = torch.from_numpy(mfcc_np).to(mel_energy.device, dtype=mel_energy.dtype)
+    mfcc_log = torch.log(mel_energy + 1e-10)
+    M = dct_matrix(n_mels, device=mel_energy.device, dtype=mel_energy.dtype)
+    mfcc = torch.matmul(mfcc_log, M.T)
     return mfcc[..., n_mfcc_start:n_mfcc_end]
 
 def mse_loss(pred, target):
@@ -100,15 +110,57 @@ def LPC(x, order=12):
                 a[1:i] -= k * a[i-1:0:-1]
                 a[i] = k
                 E *= (1 - k ** 2)
-            lpc_coeffs[c, t, 1:] = torch.from_numpy(a).to(x.device, dtype=x.dtype)
+            lpc_coeffs[c, t, 1:] = torch.from_numpy(a[1:]).to(x.device, dtype=x.dtype)
     return lpc_coeffs
 
-def NSCC(x, sample_rate, fmin=0, fmax=None, N_FFT=512):
+def NSCC(x, sample_rate, fmax=None, N_FFT=512, band_low=0, band_high=300):
     power = torch.abs(x) ** 2
     C, T, F = power.shape
+    if band_high > F:
+        band_high = F
     if fmax is None:
-        fmax = sample_rate / 2
-    b = N_FFT // 2 + 1
-    freqs = torch.tensor([k * sample_rate / N_FFT for k in range(b)], dtype=torch.float32)
-    
+        fmax = sample_rate / 2    
+    band_power  = power[:, :, band_low:band_high]
+    f = torch.arange(band_low, band_high, device=x.device, dtype=power.dtype)
+    b = f * sample_rate / (N_FFT)
+    numerator = torch.sum(band_power * b, dim=-1)
+    denominator = torch.sum(band_power, dim=-1)
+    scc = numerator / (denominator + 1e-10)   
+    l_m = band_low * sample_rate / (N_FFT)
+    h_m = (band_high - 1) * sample_rate / (N_FFT)
+    nscc = scc - (h_m + l_m) / (2.0 * (h_m - l_m + 1e-10))
+    return nscc.unsqueeze(-1)
+
+def lengthpad(x, target):
+    C, T, D = x.shape
+    _, NT, _ = target.shape
+    position = torch.arange(NT, device=x.device)
+    index = torch.round(position * (T - 1) / (NT - 1)).long()
+    clamped = torch.clamp(index, 0, T - 1)
+    x = x[:, clamped, :]
     return x
+
+def fuse(x, sample_rate):
+    preemph = preemphasis(x)
+    apply_windowed_frames_A = apply_window(frame_signal(preemph, WIN_LEN_A, HOP_LEN_A))
+    apply_windowed_frames_B = apply_window(frame_signal(preemph, WIN_LEN_B, HOP_LEN_B))
+    compute_stft_A = compute_stft(apply_windowed_frames_A, N_FFT)
+    compute_stft_B = compute_stft(apply_windowed_frames_B, N_FFT)
+    mfcc_A = mfcc(compute_stft_A)
+    mfcc_B = mfcc(compute_stft_B)
+    lengthpad_mfcc_B = lengthpad(mfcc_B, mfcc_A)
+    lpc_a = LPC(apply_windowed_frames_A)[:, :, 1:]
+    nscc_a = NSCC(compute_stft_A, sample_rate, N_FFT=N_FFT, band_low=0, band_high=300)
+    fused = torch.cat([mfcc_A, lengthpad_mfcc_B, lpc_a, nscc_a], dim=-1)
+    return fused
+
+
+C = 2
+sample_rate = 16000
+duration = 1
+L = sample_rate * duration
+
+x =torch.randn(C, L)  
+
+fused = fuse(x, sample_rate)
+print(fused.shape)  # Should print (C, T, D) where T is the number of frames and D is the feature dimension
