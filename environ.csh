@@ -30,6 +30,8 @@ pip install numpy
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install einops
 pip install soundfile
+pip install matplotlib
+
 
 
 

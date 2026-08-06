@@ -591,7 +591,7 @@ class GTCRN_IVA(nn.Module):
                 def _np(t):
                     return t.detach().cpu().numpy() if torch.is_tensor(t) else t
 
-                fig, axs = plt.subplots(4, 1, figsize=(11, 15), sharex=False)
+                fig, axs = plt.subplots(3, 1, figsize=(11, 15), sharex=False)
 
                 axs[0].plot(_np(x[0, 0]))
                 axs[0].set_title('Input Audio (noisy)')

@@ -36,15 +36,6 @@ def estimate_noise_energy_noise_seg(short_time_energy_frame,
     return noise_energy
 
 
-def estimate_noise_energy_speech_seg(short_time_energy_frame,
-                                     noise_energy_prev_frame,
-                                     scale_factor):
-
-    noise_energy = scale_factor * noise_energy_prev_frame         \
-                    + (1 - scale_factor) * short_time_energy_frame
-
-    return noise_energy
-
 
 def update_noise_threshold(
         delta_n, noise_energy_noise_seg):
@@ -145,11 +136,7 @@ def run_energy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s, plot_output = False):
 
 
 def calculate_short_time_entropy(frames_np, eps=1e-12):
-    # spectral entropy per frame (column), Renevey's actual feature.
-    # raw entropy is HIGH for noise (flat spectrum) and LOW for speech (peaky
-    # spectrum) -- that's backwards vs e_st, so negate it here once, up front,
-    # so every downstream function (built for "bigger == more speech-like")
-    # just works unmodified.
+
     spectrum = np.abs(np.fft.rfft(frames_np, axis=0)) ** 2
     prob = spectrum / (np.sum(spectrum, axis=0, keepdims=True) + eps)
     entropy = -np.sum(prob * np.log(prob + eps), axis=0)
@@ -157,10 +144,6 @@ def calculate_short_time_entropy(frames_np, eps=1e-12):
 
 
 def run_entropy_vad(frames, ad_sf_n, ad_sf_s, d_n, d_s, plot_output=False):
-    # literal copy of run_energy_vad with e_st swapped for the entropy feature --
-    # every helper below (estimate_noise_energy_*_seg, update_*_threshold,
-    # is_speech_frame) is generic over "some scalar per frame" so none of it
-    # needed to change.
     is_torch = torch.is_tensor(frames)
     if is_torch:
         device = frames.device

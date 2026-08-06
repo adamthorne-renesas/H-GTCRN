@@ -575,9 +575,7 @@ class GTCRN_IVA(nn.Module):
             
             vad_detector = vad_sf_br(window=11)
             ltsf, band_ratio, score, selected_channel, vad, decision = vad_detector.detect_voice_activity(
-                spec_2ch,
-                alpha=0.5,
-                beta=0.5
+                spec_2ch, alpha = 0.45, beta = 0.45, ema = 0.95, t_low = 0.4, t_high = 0.5, band_start = 61, band_end = 108
             )
 
             # STFT of the raw noisy mixture (pre-WPE/IVA), same (B, C, F, T) shape as spec_2ch.
@@ -591,7 +589,7 @@ class GTCRN_IVA(nn.Module):
             if plot_output is True:  # plot_output is True
                 def _np(t):
                     return t.detach().cpu().numpy() if torch.is_tensor(t) else t
-                fig, axs = plt.subplots(4, 1, figsize=(11, 15), sharex=False)
+                fig, axs = plt.subplots(3, 1, figsize=(11, 15), sharex=False)
                 
                 axs[0].plot(_np(x[0, 0]))
                 axs[0].set_title('Input Audio (noisy)')
