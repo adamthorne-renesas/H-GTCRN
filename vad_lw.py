@@ -7,7 +7,7 @@ import torch
 
 #https://www.sciencedirect.com/science/article/pii/S1051200423002464#se0050
 
-N_FFT = 512
+N_FFT = 1024
 HOP_LEN_A = 160
 HOP_LEN_B = 320
 WIN_LEN_A = 320
@@ -71,7 +71,7 @@ def mel_filter_bank(n_mels, n_fft, sample_rate, fmin=0.0, fmax=None):
                 fb[m - 1, k] = (k - left) / (center - left)
             for k in range(center, right):
                 fb[m - 1, k] = (right - k) / (right - center)
-    return fb
+    return fb, hz_points
 
 def dct_matrix(n_mels, device, dtype):
     # DCT-II orthonormal matrix, shape (n_mels, n_mels)
@@ -82,9 +82,9 @@ def dct_matrix(n_mels, device, dtype):
     M[0] *= 1 / torch.sqrt(torch.tensor(2.0))   # ortho normalization for k=0
     return M   # apply via  log_mel @ M.T
 
-def mfcc(x, n_mels=26, n_mfcc_start=2, n_mfcc_end=14, N_FFT=512):
+def mfcc(x, n_mels=26, n_mfcc_start=2, n_mfcc_end=14, N_FFT=1024):
     power = torch.abs(x) ** 2
-    mel_fb = mel_filter_bank(n_mels=n_mels, n_fft=N_FFT, sample_rate=16000)
+    mel_fb, _ = mel_filter_bank(n_mels=n_mels, n_fft=N_FFT, sample_rate=16000)
     mel_energy = torch.matmul(power, mel_fb.T)
     mfcc_log = torch.log(mel_energy + 1e-10)
     M = dct_matrix(n_mels, device=mel_energy.device, dtype=mel_energy.dtype)
@@ -106,28 +106,23 @@ def LPC(x, order=12):
             E = R[0]
             a[0] = 1.0
             for i in range(1, order + 1):
+                #reflection coefficient
                 k = (R[i] - np.dot(a[1:i], R[i-1:0:-1])) / E
+                #update old coefficients
                 a[1:i] -= k * a[i-1:0:-1]
+                #set new coefficient
                 a[i] = k
+                #update prediction error
                 E *= (1 - k ** 2)
             lpc_coeffs[c, t, 1:] = torch.from_numpy(a[1:]).to(x.device, dtype=x.dtype)
     return lpc_coeffs
 
-def NSCC(x, sample_rate, fmax=None, N_FFT=512, band_low=0, band_high=300):
-    power = torch.abs(x) ** 2
-    C, T, F = power.shape
-    if band_high > F:
-        band_high = F
-    if fmax is None:
-        fmax = sample_rate / 2    
-    band_power  = power[:, :, band_low:band_high]
-    f = torch.arange(band_low, band_high, device=x.device, dtype=power.dtype)
-    b = f * sample_rate / (N_FFT)
-    numerator = torch.sum(band_power * b, dim=-1)
-    denominator = torch.sum(band_power, dim=-1)
+def NSCC(x, hz_points):
+    numerator = torch.sum(x * hz_points[1:-1], dim=-1)
+    denominator = torch.sum(x, dim=-1)
     scc = numerator / (denominator + 1e-10)   
-    l_m = band_low * sample_rate / (N_FFT)
-    h_m = (band_high - 1) * sample_rate / (N_FFT)
+    l_m = hz_points[0]
+    h_m = hz_points[-1]
     nscc = scc - (h_m + l_m) / (2.0 * (h_m - l_m + 1e-10))
     return nscc.unsqueeze(-1)
 
@@ -150,9 +145,79 @@ def fuse(x, sample_rate):
     mfcc_B = mfcc(compute_stft_B)
     lengthpad_mfcc_B = lengthpad(mfcc_B, mfcc_A)
     lpc_a = LPC(apply_windowed_frames_A)[:, :, 1:]
-    nscc_a = NSCC(compute_stft_A, sample_rate, N_FFT=N_FFT, band_low=0, band_high=300)
+    fb, hz_points = mel_filter_bank(n_mels=26, n_fft=N_FFT, sample_rate=sample_rate)
+    mel_energy_A = torch.matmul(torch.abs(compute_stft_A) ** 2, fb.T)
+    nscc_a = NSCC(mel_energy_A, hz_points)
     fused = torch.cat([mfcc_A, lengthpad_mfcc_B, lpc_a, nscc_a], dim=-1)
     return fused
+
+def MOT(sample_rate, frame_length= WIN_LEN_A, hop_length=HOP_LEN_A):
+    fn = (0.25 * sample_rate - frame_length + hop_length) / (hop_length)
+    return int(fn)
+
+def BNE(x, fn):
+    fn = min(fn, x.shape[1])
+    return x[:, :fn, :].mean(dim=1)
+
+def cosine_to_background(fused, BNE):
+    fb = BNE.unsqueeze(1)
+    return torch.nn.functional.cosine_similarity(fused, fb, dim=-1)
+
+
+def CMVN(x, eps=1e-10):
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True)
+    return (x - mean) / (std + eps)
+
+def background_threshold(x, nf, param=0.15):
+    M = int(round(nf * param))
+    sorted_vals = torch.sort(x, dim=1).values
+    threshold = sorted_vals[:, :M].mean(dim=1)
+    return threshold
+
+def iEMA(theta, beta):
+    C, nF = theta.shape
+    v = torch.zeros_like(theta)
+
+    v[:, 0] = theta[:, 0]
+    for t in range(1, nF):
+        ema = beta * v[:, t - 1] + (1 - beta) * theta[:, t]
+        bias = 1- beta ** (t + 1)
+        v[:, t] = ema / bias
+    return v
+
+def update_background(fused, cos_n, T, fn):
+    C, nF, D = fused.shape
+    mask = torch.zeros((C, nF), dtype=torch.bool, device=fused.device)
+    mask [:,:fn] = True
+    m = mask & (cos_n < T.unsqueeze(-1))
+    m = mask.unsqueeze(-1).float()
+    return (m * fused).sum(dim=1) / (m.sum(dim=1) + 1e-10)
+
+def second_threshold(v_soft, hop_len=HOP_LEN_A, sample_rate=16000, lW = 6400):
+    k = lW // hop_len
+    v=v_soft.unsqueeze(-2)
+    T2 = torch.nn.functional.avg_pool1d(v, kernel_size=k, stride=1, padding=k//2)
+    return T2[:, 0, :v_soft.shape[-1]]
+
+def hysteresis(v_soft, T2, delta):
+    """v_soft:(C,nf) → v_bin:(C,nf). Operates on ALREADY-smoothed v_soft."""
+    C, nf = v_soft.shape
+    T_high = T2 + delta
+    T_low  = T2 - delta
+    v_bin = torch.zeros_like(v_soft)
+    state = torch.zeros(C, device=v_soft.device)     
+    for f in range(nf):
+        s = v_soft[:, f]                            
+        state = torch.where(s >= T_high[:, f], torch.ones_like(state), state)
+        state = torch.where(s <= T_low[:, f],  torch.zeros_like(state), state)
+        v_bin[:, f] = state
+    return v_bin
+
+
+        
+
+
 
 
 C = 2
